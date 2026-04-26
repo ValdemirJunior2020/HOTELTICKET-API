@@ -15,13 +15,34 @@ import {
   Activity,
   Settings,
   RefreshCw,
+  Lock,
+  LogOut,
+  UserCheck,
+  Database,
 } from "lucide-react";
+import {
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+} from "firebase/auth";
+import {
+  addDoc,
+  collection,
+  getDocs,
+  limit,
+  orderBy,
+  query,
+  serverTimestamp,
+} from "firebase/firestore";
+import { auth, db } from "./firebase.js";
 import {
   generateDemoTickets,
   getHealth,
   getRules,
   startSolve,
 } from "./api/client.js";
+
+const SUPER_BOSS_EMAIL = "april@hotelplanner.com";
 
 const fallbackTickets = [
   {
@@ -54,19 +75,85 @@ const fallbackTickets = [
 ];
 
 function App() {
+  const [user, setUser] = useState(null);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+  const [loginEmail, setLoginEmail] = useState(SUPER_BOSS_EMAIL);
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
+
   const [health, setHealth] = useState(null);
   const [rules, setRules] = useState([]);
   const [tickets, setTickets] = useState(fallbackTickets);
   const [selectedTicket, setSelectedTicket] = useState(fallbackTickets[0]);
-  const [query, setQuery] = useState("");
+  const [queryText, setQueryText] = useState("");
   const [solveResult, setSolveResult] = useState(null);
   const [logs, setLogs] = useState([]);
   const [isSolving, setIsSolving] = useState(false);
   const [adminMode, setAdminMode] = useState(true);
+  const [workedTickets, setWorkedTickets] = useState([]);
 
   useEffect(() => {
-    loadInitialData();
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (
+        currentUser &&
+        currentUser.email?.toLowerCase() === SUPER_BOSS_EMAIL.toLowerCase()
+      ) {
+        setUser(currentUser);
+        await loadInitialData();
+        await loadWorkedTickets();
+      } else {
+        if (currentUser) {
+          await signOut(auth);
+        }
+        setUser(null);
+      }
+
+      setCheckingAuth(false);
+    });
+
+    return () => unsubscribe();
   }, []);
+
+  async function handleLogin(event) {
+    event.preventDefault();
+    setLoginError("");
+    setLoggingIn(true);
+
+    try {
+      const credential = await signInWithEmailAndPassword(
+        auth,
+        loginEmail.trim(),
+        loginPassword
+      );
+
+      if (
+        credential.user.email?.toLowerCase() !== SUPER_BOSS_EMAIL.toLowerCase()
+      ) {
+        await signOut(auth);
+        setLoginError("Only the Super Boss Admin account can access this app.");
+        return;
+      }
+
+      setUser(credential.user);
+      await loadInitialData();
+      await loadWorkedTickets();
+    } catch (error) {
+      setLoginError(
+        "Login failed. Make sure Email/Password sign-in is enabled in Firebase and the boss account exists."
+      );
+      console.error(error);
+    } finally {
+      setLoggingIn(false);
+    }
+  }
+
+  async function handleLogout() {
+    await signOut(auth);
+    setUser(null);
+    setSolveResult(null);
+    setLogs([]);
+  }
 
   async function loadInitialData() {
     try {
@@ -102,8 +189,68 @@ function App() {
     }
   }
 
+  async function loadWorkedTickets() {
+    try {
+      const workedTicketsQuery = query(
+        collection(db, "worked_tickets"),
+        orderBy("createdAt", "desc"),
+        limit(10)
+      );
+
+      const snapshot = await getDocs(workedTicketsQuery);
+
+      const rows = snapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+
+      setWorkedTickets(rows);
+    } catch (error) {
+      console.error("Failed to load worked tickets:", error);
+    }
+  }
+
+  async function saveWorkedTicket(ticket, response, finalLogs) {
+    const matchedRule =
+      response?.matchedRule || response?.data?.matchedRule || response?.rule || null;
+
+    const requiresHumanEscalation =
+      response?.requiresHumanEscalation === true ||
+      response?.data?.requiresHumanEscalation === true ||
+      response?.escalationRequired === true ||
+      !matchedRule;
+
+    await addDoc(collection(db, "worked_tickets"), {
+      ticketId: ticket.id || "",
+      requester: ticket.requester || "",
+      subject: ticket.subject || "",
+      category: ticket.category || "",
+      issue: ticket.issue || "",
+      priority: ticket.priority || "",
+      status: ticket.status || "",
+      resultStatus: requiresHumanEscalation ? "ESCALATED" : "SOLVED",
+      requiresHumanEscalation,
+      matchedRule: matchedRule || null,
+      solveResult: response || null,
+      logs: finalLogs,
+      workedByEmail: user?.email || "",
+      createdAt: serverTimestamp(),
+    });
+
+    await loadWorkedTickets();
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function addSlowLog(message, type = "info", delay = 900) {
+    await wait(delay);
+    setLogs((prev) => [...prev, { message, type }]);
+  }
+
   const filteredTickets = useMemo(() => {
-    const text = query.toLowerCase().trim();
+    const text = queryText.toLowerCase().trim();
 
     if (!text) return tickets;
 
@@ -116,26 +263,66 @@ function App() {
         String(ticket.requester || "").toLowerCase().includes(text)
       );
     });
-  }, [query, tickets]);
+  }, [queryText, tickets]);
 
   const ruleCount = Array.isArray(rules) ? rules.length : 0;
 
   async function handleSolve(ticket) {
-    if (!ticket) return;
+    if (!ticket || isSolving) return;
 
     setSelectedTicket(ticket);
     setSolveResult(null);
+    setLogs([]);
     setIsSolving(true);
 
-    setLogs([
-      `[Fetching Ticket] ${ticket.id}`,
-      `[Reading Category] ${ticket.category || "Unknown"}`,
-      `[Reading Issue] ${ticket.issue || "Unknown"}`,
-      "[Checking Matrix Rule Engine]",
-      "[Calling Backend One-Click Solver]",
-    ]);
+    const finalLogMessages = [];
 
     try {
+      const firstLog = {
+        message: `[Fetching Ticket] ${ticket.id}`,
+        type: "info",
+      };
+      setLogs([firstLog]);
+      finalLogMessages.push(firstLog);
+
+      await addSlowLog(
+        `[Reading Category] ${ticket.category || "Unknown"}`,
+        "info",
+        1000
+      );
+      finalLogMessages.push({
+        message: `[Reading Category] ${ticket.category || "Unknown"}`,
+        type: "info",
+      });
+
+      await addSlowLog(
+        `[Reading Issue] ${ticket.issue || "Unknown"}`,
+        "info",
+        1000
+      );
+      finalLogMessages.push({
+        message: `[Reading Issue] ${ticket.issue || "Unknown"}`,
+        type: "info",
+      });
+
+      await addSlowLog("[Checking Matrix Rule Engine]", "info", 1200);
+      finalLogMessages.push({
+        message: "[Checking Matrix Rule Engine]",
+        type: "info",
+      });
+
+      await addSlowLog("[Verifying QA Compliance Rules]", "info", 1200);
+      finalLogMessages.push({
+        message: "[Verifying QA Compliance Rules]",
+        type: "info",
+      });
+
+      await addSlowLog("[Calling Backend One-Click Solver]", "info", 1200);
+      finalLogMessages.push({
+        message: "[Calling Backend One-Click Solver]",
+        type: "info",
+      });
+
       const response = await startSolve(ticket);
 
       const matchedRule =
@@ -147,43 +334,146 @@ function App() {
       const requiresHumanEscalation =
         response?.requiresHumanEscalation === true ||
         response?.data?.requiresHumanEscalation === true ||
-        response?.escalationRequired === true;
+        response?.escalationRequired === true ||
+        !matchedRule;
 
-      setSolveResult(response);
-
-      setLogs((prev) => [
-        ...prev,
-        "[Verifying QA Compliance]",
+      await addSlowLog(
         matchedRule
           ? `[Matrix Match] ${matchedRule.category || "Unknown"} / ${
               matchedRule.issue || "Unknown"
             }`
           : "[Matrix Match] No strict rule found",
+        matchedRule ? "success" : "error",
+        1200
+      );
+      finalLogMessages.push({
+        message: matchedRule
+          ? `[Matrix Match] ${matchedRule.category || "Unknown"} / ${
+              matchedRule.issue || "Unknown"
+            }`
+          : "[Matrix Match] No strict rule found",
+        type: matchedRule ? "success" : "error",
+      });
+
+      await addSlowLog(
         requiresHumanEscalation
           ? "[Final Decision] Human escalation required"
           : "[Final Decision] Safe deterministic action generated",
-      ]);
+        requiresHumanEscalation ? "error" : "success",
+        1200
+      );
+      finalLogMessages.push({
+        message: requiresHumanEscalation
+          ? "[Final Decision] Human escalation required"
+          : "[Final Decision] Safe deterministic action generated",
+        type: requiresHumanEscalation ? "error" : "success",
+      });
+
+      setSolveResult(response);
+
+      await saveWorkedTicket(ticket, response, finalLogMessages);
     } catch (error) {
       console.error(error);
 
-      setSolveResult({
+      const errorResult = {
         success: false,
         requiresHumanEscalation: true,
         message:
           "Backend unavailable or solve request failed. Defaulting to human escalation.",
         error: error.message,
-      });
+      };
 
-      setLogs((prev) => [
-        ...prev,
-        "[System Error] Backend unavailable or solve request failed",
-        "[Final Decision] Human escalation required",
-      ]);
+      setSolveResult(errorResult);
+
+      await addSlowLog("[System Error] Backend unavailable or solve failed", "error", 900);
+      await addSlowLog("[Final Decision] Human escalation required", "error", 900);
+
+      finalLogMessages.push(
+        {
+          message: "[System Error] Backend unavailable or solve failed",
+          type: "error",
+        },
+        {
+          message: "[Final Decision] Human escalation required",
+          type: "error",
+        }
+      );
+
+      try {
+        await saveWorkedTicket(ticket, errorResult, finalLogMessages);
+      } catch (saveError) {
+        console.error("Failed to save error ticket:", saveError);
+      }
     } finally {
-      setTimeout(() => {
-        setIsSolving(false);
-      }, 600);
+      await wait(1000);
+      setIsSolving(false);
     }
+  }
+
+  if (checkingAuth) {
+    return (
+      <div style={styles.loginPage}>
+        <div style={styles.loginCard}>
+          <div style={styles.loader} />
+          <h1>Checking Super Boss Access...</h1>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div style={styles.loginPage}>
+        <div style={styles.loginGlowOne} />
+        <div style={styles.loginGlowTwo} />
+
+        <form style={styles.loginCard} onSubmit={handleLogin}>
+          <div style={styles.loginIcon}>
+            <Lock size={34} />
+          </div>
+
+          <div style={styles.eyebrow}>HotelPlanner Super Boss Portal</div>
+
+          <h1 style={styles.loginTitle}>Boss Admin Login</h1>
+
+          <p style={styles.loginText}>
+            Login is restricted to the Super Boss Admin account only.
+          </p>
+
+          <label style={styles.label}>Email</label>
+          <input
+            style={styles.loginInput}
+            type="email"
+            value={loginEmail}
+            onChange={(event) => setLoginEmail(event.target.value)}
+            placeholder="april@hotelplanner.com"
+            autoComplete="email"
+          />
+
+          <label style={styles.label}>Password</label>
+          <input
+            style={styles.loginInput}
+            type="password"
+            value={loginPassword}
+            onChange={(event) => setLoginPassword(event.target.value)}
+            placeholder="Enter password"
+            autoComplete="current-password"
+          />
+
+          {loginError && <div style={styles.loginError}>{loginError}</div>}
+
+          <button style={styles.loginButton} disabled={loggingIn}>
+            <UserCheck size={19} />
+            {loggingIn ? "Logging in..." : "Login as Super Boss"}
+          </button>
+
+          <div style={styles.loginHint}>
+            Firebase Auth must have Email/Password enabled and the user{" "}
+            april@hotelplanner.com created with password 12345678.
+          </div>
+        </form>
+      </div>
+    );
   }
 
   return (
@@ -199,10 +489,17 @@ function App() {
             Deterministic matrix-first Zendesk automation with full boss
             override, visibility, and QA compliance control.
           </p>
+          <div style={styles.loggedInText}>Logged in as {user.email}</div>
         </div>
 
         <div style={styles.headerActions}>
-          <button style={styles.secondaryButton} onClick={loadInitialData}>
+          <button
+            style={styles.secondaryButton}
+            onClick={async () => {
+              await loadInitialData();
+              await loadWorkedTickets();
+            }}
+          >
             <RefreshCw size={17} />
             Refresh
           </button>
@@ -213,6 +510,11 @@ function App() {
           >
             <ShieldCheck size={17} />
             {adminMode ? "Boss Mode On" : "Boss Mode Off"}
+          </button>
+
+          <button style={styles.logoutButton} onClick={handleLogout}>
+            <LogOut size={17} />
+            Logout
           </button>
         </div>
       </header>
@@ -230,9 +532,7 @@ function App() {
           </div>
 
           <div style={styles.selectedBox}>
-            <div style={styles.ticketId}>
-              {selectedTicket?.id || "No Ticket"}
-            </div>
+            <div style={styles.ticketId}>{selectedTicket?.id || "No Ticket"}</div>
 
             <div style={styles.ticketSubject}>
               {selectedTicket?.subject || "Select a ticket to begin"}
@@ -287,7 +587,7 @@ function App() {
 
             <StatusRow label="Escalation Safety" value="Enabled" good={true} />
 
-            <StatusRow label="LLM Drafting" value="Rules first" good={true} />
+            <StatusRow label="Firestore Save" value="Enabled" good={true} />
           </div>
         </section>
 
@@ -312,8 +612,8 @@ function App() {
             </div>
 
             <div style={styles.adminItem}>
-              <span>Refund execution</span>
-              <strong>Mock API</strong>
+              <span>Worked tickets saving</span>
+              <strong>Firestore</strong>
             </div>
 
             <div style={styles.adminItem}>
@@ -336,8 +636,8 @@ function App() {
             <Search size={18} />
             <input
               style={styles.input}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              value={queryText}
+              onChange={(event) => setQueryText(event.target.value)}
               placeholder="Search ticket, category, issue..."
             />
           </div>
@@ -414,7 +714,8 @@ function App() {
             <div>
               <h2 style={styles.cardTitle}>Live Execution Trace</h2>
               <p style={styles.cardText}>
-                What the system is checking step by step.
+                Slow visible solving steps with green success and red danger
+                status.
               </p>
             </div>
             <Bell size={26} />
@@ -425,9 +726,58 @@ function App() {
               <p style={styles.mutedText}>No execution logs yet.</p>
             ) : (
               logs.map((log, index) => (
-                <div key={`${log}-${index}`} style={styles.logLine}>
+                <div
+                  key={`${log.message}-${index}`}
+                  style={{
+                    ...styles.logLine,
+                    ...(log.type === "success" ? styles.logSuccess : {}),
+                    ...(log.type === "error" ? styles.logError : {}),
+                  }}
+                >
                   <span>{String(index + 1).padStart(2, "0")}</span>
-                  <p>{log}</p>
+                  <p>{log.message}</p>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+
+        <section style={{ ...styles.card, ...styles.workedCard }}>
+          <div style={styles.cardHeader}>
+            <div>
+              <h2 style={styles.cardTitle}>Worked Tickets Saved</h2>
+              <p style={styles.cardText}>
+                Last solved or escalated tickets saved in Firebase Firestore.
+              </p>
+            </div>
+            <Database size={26} />
+          </div>
+
+          <div style={styles.workedList}>
+            {workedTickets.length === 0 ? (
+              <p style={styles.mutedText}>No worked tickets saved yet.</p>
+            ) : (
+              workedTickets.map((ticket) => (
+                <div key={ticket.id} style={styles.workedItem}>
+                  <div style={styles.ticketButtonTop}>
+                    <strong>{ticket.ticketId}</strong>
+                    <span
+                      style={
+                        ticket.resultStatus === "SOLVED"
+                          ? styles.greenBadge
+                          : styles.redBadge
+                      }
+                    >
+                      {ticket.resultStatus}
+                    </span>
+                  </div>
+
+                  <p>{ticket.subject}</p>
+
+                  <small>
+                    {ticket.category || "Unknown"} / {ticket.issue || "Unknown"}{" "}
+                    — by {ticket.workedByEmail}
+                  </small>
                 </div>
               ))
             )}
@@ -443,14 +793,21 @@ function App() {
             <h2>Running One-Click Solver</h2>
 
             <p>
-              The system is checking the matrix, QA rules, escalation triggers,
-              and safe action path.
+              The system is slowly checking the matrix, QA rules, escalation
+              triggers, and safe action path.
             </p>
 
             <div style={styles.modalLogs}>
               {logs.map((log, index) => (
-                <div key={`${log}-modal-${index}`} style={styles.modalLogLine}>
-                  {log}
+                <div
+                  key={`${log.message}-modal-${index}`}
+                  style={{
+                    ...styles.modalLogLine,
+                    ...(log.type === "success" ? styles.modalLogSuccess : {}),
+                    ...(log.type === "error" ? styles.modalLogError : {}),
+                  }}
+                >
+                  {log.message}
                 </div>
               ))}
             </div>
@@ -471,6 +828,117 @@ function StatusRow({ label, value, good }) {
 }
 
 const styles = {
+  loginPage: {
+    minHeight: "100vh",
+    background:
+      "radial-gradient(circle at top left, #16a34a 0, transparent 26%), radial-gradient(circle at bottom right, #dc2626 0, transparent 25%), #070b16",
+    color: "#f8fafc",
+    display: "grid",
+    placeItems: "center",
+    padding: "28px",
+    fontFamily:
+      'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    position: "relative",
+    overflow: "hidden",
+  },
+  loginGlowOne: {
+    position: "fixed",
+    width: "380px",
+    height: "380px",
+    borderRadius: "999px",
+    background: "rgba(34, 197, 94, 0.16)",
+    filter: "blur(70px)",
+    top: "10%",
+    left: "10%",
+  },
+  loginGlowTwo: {
+    position: "fixed",
+    width: "380px",
+    height: "380px",
+    borderRadius: "999px",
+    background: "rgba(239, 68, 68, 0.14)",
+    filter: "blur(70px)",
+    bottom: "10%",
+    right: "10%",
+  },
+  loginCard: {
+    width: "min(460px, 100%)",
+    background: "rgba(15, 23, 42, 0.78)",
+    border: "1px solid rgba(255,255,255,0.14)",
+    borderRadius: "30px",
+    padding: "30px",
+    backdropFilter: "blur(18px)",
+    boxShadow: "0 30px 100px rgba(0,0,0,0.45)",
+    position: "relative",
+    zIndex: 1,
+  },
+  loginIcon: {
+    width: "68px",
+    height: "68px",
+    borderRadius: "22px",
+    background: "linear-gradient(135deg, #16a34a, #2563eb)",
+    display: "grid",
+    placeItems: "center",
+    marginBottom: "18px",
+  },
+  loginTitle: {
+    margin: "0 0 10px",
+    fontSize: "34px",
+    letterSpacing: "-0.04em",
+  },
+  loginText: {
+    color: "#cbd5e1",
+    lineHeight: 1.6,
+    marginBottom: "20px",
+  },
+  label: {
+    display: "block",
+    fontSize: "13px",
+    color: "#cbd5e1",
+    fontWeight: 800,
+    margin: "14px 0 7px",
+  },
+  loginInput: {
+    width: "100%",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: "16px",
+    padding: "14px",
+    background: "rgba(2, 6, 23, 0.55)",
+    color: "#f8fafc",
+    outline: 0,
+    fontSize: "15px",
+  },
+  loginButton: {
+    width: "100%",
+    border: 0,
+    borderRadius: "18px",
+    padding: "15px 18px",
+    marginTop: "18px",
+    background: "linear-gradient(135deg, #16a34a, #2563eb)",
+    color: "white",
+    fontWeight: 900,
+    fontSize: "15px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "10px",
+    cursor: "pointer",
+  },
+  loginError: {
+    marginTop: "14px",
+    padding: "12px",
+    borderRadius: "14px",
+    background: "rgba(239, 68, 68, 0.16)",
+    border: "1px solid rgba(239, 68, 68, 0.3)",
+    color: "#fecaca",
+    fontWeight: 800,
+  },
+  loginHint: {
+    marginTop: "14px",
+    color: "#94a3b8",
+    fontSize: "12px",
+    lineHeight: 1.5,
+  },
   page: {
     minHeight: "100vh",
     background:
@@ -534,6 +1002,12 @@ const styles = {
     fontSize: "16px",
     lineHeight: 1.6,
   },
+  loggedInText: {
+    marginTop: "10px",
+    color: "#86efac",
+    fontSize: "13px",
+    fontWeight: 800,
+  },
   headerActions: {
     display: "flex",
     gap: "12px",
@@ -565,7 +1039,10 @@ const styles = {
     gridColumn: "span 7",
   },
   logsCard: {
-    gridColumn: "span 12",
+    gridColumn: "span 7",
+  },
+  workedCard: {
+    gridColumn: "span 5",
   },
   cardHeader: {
     display: "flex",
@@ -631,7 +1108,7 @@ const styles = {
     border: 0,
     borderRadius: "18px",
     padding: "15px 18px",
-    background: "linear-gradient(135deg, #2563eb, #9333ea)",
+    background: "linear-gradient(135deg, #16a34a, #2563eb)",
     color: "white",
     fontWeight: 900,
     fontSize: "15px",
@@ -640,7 +1117,7 @@ const styles = {
     justifyContent: "center",
     gap: "10px",
     cursor: "pointer",
-    boxShadow: "0 16px 40px rgba(37, 99, 235, 0.32)",
+    boxShadow: "0 16px 40px rgba(22, 163, 74, 0.28)",
   },
   secondaryButton: {
     border: "1px solid rgba(255,255,255,0.14)",
@@ -661,6 +1138,19 @@ const styles = {
     padding: "11px 14px",
     background: "rgba(34, 197, 94, 0.16)",
     color: "#bbf7d0",
+    fontWeight: 800,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    backdropFilter: "blur(16px)",
+  },
+  logoutButton: {
+    border: "1px solid rgba(239, 68, 68, 0.3)",
+    borderRadius: "14px",
+    padding: "11px 14px",
+    background: "rgba(239, 68, 68, 0.14)",
+    color: "#fecaca",
     fontWeight: 800,
     cursor: "pointer",
     display: "flex",
@@ -816,6 +1306,16 @@ const styles = {
     background: "rgba(2, 6, 23, 0.45)",
     border: "1px solid rgba(255,255,255,0.07)",
   },
+  logSuccess: {
+    background: "rgba(34, 197, 94, 0.16)",
+    border: "1px solid rgba(34, 197, 94, 0.35)",
+    color: "#bbf7d0",
+  },
+  logError: {
+    background: "rgba(239, 68, 68, 0.16)",
+    border: "1px solid rgba(239, 68, 68, 0.35)",
+    color: "#fecaca",
+  },
   modalOverlay: {
     position: "fixed",
     inset: 0,
@@ -840,7 +1340,7 @@ const styles = {
     height: "52px",
     borderRadius: "999px",
     border: "4px solid rgba(255,255,255,0.16)",
-    borderTopColor: "#60a5fa",
+    borderTopColor: "#22c55e",
     margin: "0 auto 16px",
     animation: "spin 1s linear infinite",
   },
@@ -859,6 +1359,46 @@ const styles = {
     border: "1px solid rgba(255,255,255,0.08)",
     color: "#cbd5e1",
     fontSize: "13px",
+  },
+  modalLogSuccess: {
+    background: "rgba(34, 197, 94, 0.16)",
+    border: "1px solid rgba(34, 197, 94, 0.35)",
+    color: "#bbf7d0",
+  },
+  modalLogError: {
+    background: "rgba(239, 68, 68, 0.16)",
+    border: "1px solid rgba(239, 68, 68, 0.35)",
+    color: "#fecaca",
+  },
+  workedList: {
+    display: "grid",
+    gap: "10px",
+    maxHeight: "420px",
+    overflowY: "auto",
+    paddingRight: "4px",
+  },
+  workedItem: {
+    border: "1px solid rgba(255,255,255,0.08)",
+    borderRadius: "18px",
+    padding: "14px",
+    background: "rgba(2, 6, 23, 0.45)",
+    color: "#f8fafc",
+  },
+  greenBadge: {
+    borderRadius: "999px",
+    padding: "5px 9px",
+    fontSize: "11px",
+    background: "rgba(34, 197, 94, 0.16)",
+    color: "#bbf7d0",
+    border: "1px solid rgba(34, 197, 94, 0.35)",
+  },
+  redBadge: {
+    borderRadius: "999px",
+    padding: "5px 9px",
+    fontSize: "11px",
+    background: "rgba(239, 68, 68, 0.16)",
+    color: "#fecaca",
+    border: "1px solid rgba(239, 68, 68, 0.35)",
   },
 };
 

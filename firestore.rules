@@ -1,0 +1,20 @@
+// C:\Users\User\Downloads\HotelPlanner_Solver\HotelPlanner_Solver\firestore.rules
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSuperBoss() {
+      return request.auth != null
+        && request.auth.token.email == "april@hotelplanner.com";
+    }
+
+    match /worked_tickets/{ticketId} {
+      allow read, create, update, delete: if isSuperBoss();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
