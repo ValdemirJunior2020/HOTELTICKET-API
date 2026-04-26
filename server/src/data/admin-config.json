@@ -1,0 +1,7 @@
+{
+  "allowAutoClose": false,
+  "forceHumanReview": false,
+  "escalationThreshold": 1,
+  "bossVisibility": true,
+  "updatedAt": "2026-04-26T00:00:00.000Z"
+}

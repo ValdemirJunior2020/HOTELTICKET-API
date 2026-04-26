@@ -1,0 +1,46 @@
+/* C:\Users\User\Downloads\HotelPlanner_Solver\HotelPlanner_Solver\client\src\styles.css */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background: #070b16;
+}
+
+button,
+input {
+  font-family: inherit;
+}
+
+button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 1000px) {
+  main {
+    grid-template-columns: 1fr !important;
+  }
+
+  section {
+    grid-column: span 1 !important;
+  }
+
+  header {
+    flex-direction: column;
+  }
+}
