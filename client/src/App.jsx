@@ -20,7 +20,6 @@ import {
   generateDemoTickets,
   getHealth,
   getRules,
-  solveStreamUrl,
   startSolve,
 } from "./api/client.js";
 
@@ -92,6 +91,7 @@ function App() {
         const normalizedTickets = Array.isArray(ticketData.value)
           ? ticketData.value
           : ticketData.value?.tickets || [];
+
         if (normalizedTickets.length > 0) {
           setTickets(normalizedTickets);
           setSelectedTicket(normalizedTickets[0]);
@@ -125,56 +125,47 @@ function App() {
 
     setSelectedTicket(ticket);
     setSolveResult(null);
-    setLogs([]);
     setIsSolving(true);
 
-    const localLogs = [
+    setLogs([
       `[Fetching Ticket] ${ticket.id}`,
       `[Reading Category] ${ticket.category || "Unknown"}`,
       `[Reading Issue] ${ticket.issue || "Unknown"}`,
       "[Checking Matrix Rule Engine]",
-    ];
-
-    setLogs(localLogs);
+      "[Calling Backend One-Click Solver]",
+    ]);
 
     try {
-      const eventSource = new EventSource(solveStreamUrl(ticket.id));
-
-      eventSource.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data);
-
-          if (payload.message) {
-            setLogs((prev) => [...prev, payload.message]);
-          }
-
-          if (payload.done) {
-            eventSource.close();
-          }
-        } catch {
-          setLogs((prev) => [...prev, event.data]);
-        }
-      };
-
-      eventSource.onerror = () => {
-        eventSource.close();
-      };
-
       const response = await startSolve(ticket);
 
+      const matchedRule =
+        response?.matchedRule ||
+        response?.data?.matchedRule ||
+        response?.rule ||
+        null;
+
+      const requiresHumanEscalation =
+        response?.requiresHumanEscalation === true ||
+        response?.data?.requiresHumanEscalation === true ||
+        response?.escalationRequired === true;
+
       setSolveResult(response);
+
       setLogs((prev) => [
         ...prev,
         "[Verifying QA Compliance]",
-        response?.matchedRule
-          ? `[Matrix Match] ${response.matchedRule.category} / ${response.matchedRule.issue}`
+        matchedRule
+          ? `[Matrix Match] ${matchedRule.category || "Unknown"} / ${
+              matchedRule.issue || "Unknown"
+            }`
           : "[Matrix Match] No strict rule found",
-        response?.requiresHumanEscalation
+        requiresHumanEscalation
           ? "[Final Decision] Human escalation required"
           : "[Final Decision] Safe deterministic action generated",
       ]);
     } catch (error) {
       console.error(error);
+
       setSolveResult({
         success: false,
         requiresHumanEscalation: true,
@@ -239,7 +230,10 @@ function App() {
           </div>
 
           <div style={styles.selectedBox}>
-            <div style={styles.ticketId}>{selectedTicket?.id || "No Ticket"}</div>
+            <div style={styles.ticketId}>
+              {selectedTicket?.id || "No Ticket"}
+            </div>
+
             <div style={styles.ticketSubject}>
               {selectedTicket?.subject || "Select a ticket to begin"}
             </div>
@@ -248,9 +242,11 @@ function App() {
               <span style={styles.pill}>
                 Category: {selectedTicket?.category || "Unknown"}
               </span>
+
               <span style={styles.pill}>
                 Issue: {selectedTicket?.issue || "Unknown"}
               </span>
+
               <span style={styles.priorityPill}>
                 {selectedTicket?.priority || "normal"}
               </span>
@@ -282,21 +278,16 @@ function App() {
               value={health?.status || "Unknown"}
               good={health?.status === "ok" || health?.success === true}
             />
+
             <StatusRow
               label="Rule Engine"
               value={`${ruleCount} rules loaded`}
               good={ruleCount > 0}
             />
-            <StatusRow
-              label="Escalation Safety"
-              value="Enabled"
-              good={true}
-            />
-            <StatusRow
-              label="LLM Drafting"
-              value="Rules first"
-              good={true}
-            />
+
+            <StatusRow label="Escalation Safety" value="Enabled" good={true} />
+
+            <StatusRow label="LLM Drafting" value="Rules first" good={true} />
           </div>
         </section>
 
@@ -314,14 +305,17 @@ function App() {
               <span>Human escalation fallback</span>
               <strong>Always On</strong>
             </div>
+
             <div style={styles.adminItem}>
               <span>Undefined matrix issue</span>
               <strong>Escalate</strong>
             </div>
+
             <div style={styles.adminItem}>
               <span>Refund execution</span>
               <strong>Mock API</strong>
             </div>
+
             <div style={styles.adminItem}>
               <span>Manager override</span>
               <strong>{adminMode ? "Enabled" : "Disabled"}</strong>
@@ -363,7 +357,9 @@ function App() {
                   <strong>{ticket.id}</strong>
                   <span>{ticket.priority || "normal"}</span>
                 </div>
+
                 <p>{ticket.subject}</p>
+
                 <small>
                   {ticket.category || "Unknown"} / {ticket.issue || "Unknown"}
                 </small>
@@ -400,6 +396,7 @@ function App() {
                 ) : (
                   <CheckCircle2 size={20} />
                 )}
+
                 <span>
                   {solveResult.requiresHumanEscalation
                     ? "Human Escalation Required"
@@ -407,9 +404,7 @@ function App() {
                 </span>
               </div>
 
-              <pre style={styles.pre}>
-                {JSON.stringify(solveResult, null, 2)}
-              </pre>
+              <pre style={styles.pre}>{JSON.stringify(solveResult, null, 2)}</pre>
             </div>
           )}
         </section>
@@ -444,7 +439,9 @@ function App() {
         <div style={styles.modalOverlay}>
           <div style={styles.modal}>
             <div style={styles.loader} />
+
             <h2>Running One-Click Solver</h2>
+
             <p>
               The system is checking the matrix, QA rules, escalation triggers,
               and safe action path.
